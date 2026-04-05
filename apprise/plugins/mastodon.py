@@ -1,7 +1,7 @@
 # BSD 2-Clause License
 #
 # Apprise - Push Notification Library.
-# Copyright (c) 2025, Chris Caron <lead2gold@gmail.com>
+# Copyright (c) 2026, Chris Caron <lead2gold@gmail.com>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -206,21 +206,6 @@ class NotifyMastodon(NotifyBase):
                 "values": MASTODON_MESSAGE_VISIBILITIES,
                 "default": MastodonMessageVisibility.DEFAULT,
             },
-            "cache": {
-                "name": _("Cache Results"),
-                "type": "bool",
-                "default": True,
-            },
-            "batch": {
-                "name": _("Batch Mode"),
-                "type": "bool",
-                "default": True,
-            },
-            "sensitive": {
-                "name": _("Sensitive Attachments"),
-                "type": "bool",
-                "default": False,
-            },
             "spoiler": {
                 "name": _("Spoiler Text"),
                 "type": "string",
@@ -233,8 +218,23 @@ class NotifyMastodon(NotifyBase):
                 "name": _("Language Code"),
                 "type": "string",
             },
+            "cache": {
+                "name": _("Cache Results"),
+                "type": "bool",
+                "default": True,
+            },
+            "sensitive": {
+                "name": _("Sensitive Attachments"),
+                "type": "bool",
+                "default": False,
+            },
             "to": {
                 "alias_of": "targets",
+            },
+            "batch": {
+                "name": _("Batch Mode"),
+                "type": "bool",
+                "default": True,
             },
         },
     )
@@ -444,7 +444,6 @@ class NotifyMastodon(NotifyBase):
             not self.targets
             and self.visibility == MastodonMessageVisibility.DIRECT
         ):
-
             result = self._whoami()
             if not result:
                 # Could not access our status
@@ -553,13 +552,15 @@ class NotifyMastodon(NotifyBase):
                 #  'description': None,
                 #  'blurhash': 'UmIsdJnT^mX4V@XQofnQ~Ebq%4o3ofnQjZbt'
                 # }
-                response.update({
-                    # Update our response to additionally include the
-                    # attachment details
-                    "file_name": attachment.name,
-                    "file_mime": attachment.mimetype,
-                    "file_path": attachment.path,
-                })
+                response.update(
+                    {
+                        # Update our response to additionally include the
+                        # attachment details
+                        "file_name": attachment.name,
+                        "file_mime": attachment.mimetype,
+                        "file_path": attachment.path,
+                    }
+                )
 
                 # Save our pre-prepared payload for attachment posting
                 attachments.append(response)
@@ -629,21 +630,21 @@ class NotifyMastodon(NotifyBase):
                 batches.append(batch)
 
             for no, media_ids in enumerate(batches):
-                _payload = deepcopy(payload)
-                _payload["media_ids"] = media_ids
+                payload_ = deepcopy(payload)
+                payload_["media_ids"] = media_ids
 
                 if no or not body:
                     # strip text and replace it with the image representation
-                    _payload["status"] = f"{no + 1:02d}/{len(batches):02d}"
+                    payload_["status"] = f"{no + 1:02d}/{len(batches):02d}"
                     # No longer sensitive information
-                    _payload["sensitive"] = False
+                    payload_["sensitive"] = False
                     if self.idempotency_key:
                         # Support multiposts while a Idempotency Key has been
                         # defined
-                        _payload["Idempotency-Key"] = (
+                        payload_["Idempotency-Key"] = (
                             f"{self.idempotency_key}-part{no:02d}"
                         )
-                payloads.append(_payload)
+                payloads.append(payload_)
 
         # Error Tracking
         has_error = False
@@ -934,7 +935,6 @@ class NotifyMastodon(NotifyBase):
                 requests.codes.created,
                 requests.codes.accepted,
             ):
-
                 # We had a problem
                 status_str = NotifyMastodon.http_response_code_lookup(
                     r.status_code
@@ -947,7 +947,8 @@ class NotifyMastodon(NotifyBase):
                 )
 
                 self.logger.debug(
-                    "Response Details:\r\n%r", (r.content or b"")[:2000])
+                    "Response Details:\r\n%r", (r.content or b"")[:2000]
+                )
 
                 # Mark our failure
                 return (False, content)

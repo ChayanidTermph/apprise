@@ -1,7 +1,7 @@
 # BSD 2-Clause License
 #
 # Apprise - Push Notification Library.
-# Copyright (c) 2025, Chris Caron <lead2gold@gmail.com>
+# Copyright (c) 2026, Chris Caron <lead2gold@gmail.com>
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
@@ -219,6 +219,7 @@ class NotifyMatrix(NotifyBase):
             "host": {
                 "name": _("Hostname"),
                 "type": "string",
+                "required": True,
             },
             "port": {
                 "name": _("Port"),
@@ -280,6 +281,11 @@ class NotifyMatrix(NotifyBase):
                 "type": "bool",
                 "default": True,
             },
+            "hsreq": {
+                "name": _("Force Home Server on Room IDs"),
+                "type": "bool",
+                "default": True,
+            },
             "mode": {
                 "name": _("Webhook Mode"),
                 "type": "choice:string",
@@ -298,11 +304,11 @@ class NotifyMatrix(NotifyBase):
                 "values": MATRIX_MESSAGE_TYPES,
                 "default": MatrixMessageType.TEXT,
             },
-            "to": {
-                "alias_of": "targets",
-            },
             "token": {
                 "alias_of": "token",
+            },
+            "to": {
+                "alias_of": "targets",
             },
         },
     )
@@ -315,6 +321,7 @@ class NotifyMatrix(NotifyBase):
         version=None,
         include_image=None,
         discovery=None,
+        hsreq=None,
         **kwargs,
     ):
         """Initialize Matrix Object."""
@@ -347,6 +354,13 @@ class NotifyMatrix(NotifyBase):
             self.template_args["discovery"]["default"]
             if discovery is None
             else discovery
+        )
+
+        # When enabled, room IDs missing a ':homeserver' segment will
+        # be treated as legacy identifiers and automatically suffixed
+        # with the authenticated homeserver.
+        self.hsreq = (
+            self.template_args["hsreq"]["default"] if hsreq is None else hsreq
         )
 
         # Setup our mode
@@ -516,7 +530,8 @@ class NotifyMatrix(NotifyBase):
                 )
 
                 self.logger.debug(
-                    "Response Details:\r\n%r", (r.content or b"")[:2000])
+                    "Response Details:\r\n%r", (r.content or b"")[:2000]
+                )
 
                 # Return; we're done
                 return False
@@ -573,13 +588,15 @@ class NotifyMatrix(NotifyBase):
             "username": self.user if self.user else self.app_id,
             # Use Markdown language
             "mrkdwn": self.notify_format == NotifyFormat.MARKDOWN,
-            "attachments": [{
-                "title": title,
-                "text": body,
-                "color": self.color(notify_type),
-                "ts": time(),
-                "footer": self.app_id,
-            }],
+            "attachments": [
+                {
+                    "title": title,
+                    "text": body,
+                    "color": self.color(notify_type),
+                    "ts": time(),
+                    "footer": self.app_id,
+                }
+            ],
         }
 
         return payload
@@ -657,8 +674,11 @@ class NotifyMatrix(NotifyBase):
             self.access_token = self.password
             self.transaction_id = uuid.uuid4()
 
-        if self.access_token is None and not self._login() \
-                and not self._register():
+        if (
+            self.access_token is None
+            and not self._login()
+            and not self._register()
+        ):
             # We need to register
             return False
 
@@ -687,12 +707,8 @@ class NotifyMatrix(NotifyBase):
                 return False
 
         while len(rooms) > 0:
-
             # Get our room
             room = rooms.pop(0)
-
-            # Set method according to MatrixVersion
-            method = "PUT" if self.version == MatrixVersion.V3 else "POST"
 
             # Get our room_id from our response
             room_id = self._room_join(room)
@@ -709,15 +725,10 @@ class NotifyMatrix(NotifyBase):
                 None if not self.include_image else self.image_url(notify_type)
             )
 
-            # Build our path
-            if self.version == MatrixVersion.V3:
-                path = f"/rooms/{NotifyMatrix.quote(room_id)}" \
-                    f"/send/m.room.message/{self.transaction_id}"
-
-            else:
-                path = (
-                    f"/rooms/{NotifyMatrix.quote(room_id)}/send/m.room.message"
-                )
+            # Always use PUT with a transaction ID (spec-compliant since 2015)
+            path = "/rooms/{}/send/m.room.message/{}".format(
+                NotifyMatrix.quote(room_id), self.transaction_id
+            )
 
             if image_url and self.version == MatrixVersion.V2:
                 # Define our payload
@@ -729,11 +740,25 @@ class NotifyMatrix(NotifyBase):
 
                 # Post our content
                 postokay, _, _ = self._fetch(
-                    path, payload=image_payload)
+                    path, payload=image_payload, method="PUT"
+                )
                 if not postokay:
                     # Mark our failure
                     has_error = True
                     continue
+
+                # Increment transaction ID so subsequent sends
+                # don't reuse the same path
+                if self.access_token != self.password:
+                    self.transaction_id += 1
+                    self.store.set(
+                        "transaction_id",
+                        self.transaction_id,
+                        expires=self.default_cache_expiry_sec,
+                    )
+                    path = "/rooms/{}/send/m.room.message/{}".format(
+                        NotifyMatrix.quote(room_id), self.transaction_id
+                    )
 
             if attachments:
                 for attachment in attachments:
@@ -741,16 +766,18 @@ class NotifyMatrix(NotifyBase):
                     attachment["type"] = "m.room.message"
 
                     postokay, _, _ = self._fetch(
-                        path, payload=attachment, method=method)
+                        path, payload=attachment, method="PUT"
+                    )
 
                     # Increment the transaction ID to avoid future messages
                     # being recognized as retransmissions and ignored
-                    if self.version == MatrixVersion.V3 \
-                       and self.access_token != self.password:
+                    if self.access_token != self.password:
                         self.transaction_id += 1
                         self.store.set(
-                            "transaction_id", self.transaction_id,
-                            expires=self.default_cache_expiry_sec)
+                            "transaction_id",
+                            self.transaction_id,
+                            expires=self.default_cache_expiry_sec,
+                        )
                         path = "/rooms/{}/send/m.room.message/{}".format(
                             NotifyMatrix.quote(room_id),
                             self.transaction_id,
@@ -772,16 +799,18 @@ class NotifyMatrix(NotifyBase):
             # Update our payload advance formatting for the services that
             # support them.
             if self.notify_format == NotifyFormat.HTML:
-                payload.update({
-                    "format": "org.matrix.custom.html",
-                    "formatted_body": "{title}{body}".format(
-                        title="" if not title else f"<h1>{title}</h1>",
-                        body=body,
-                    ),
-                })
+                payload.update(
+                    {
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": "{title}{body}".format(
+                            title="" if not title else f"<h1>{title}</h1>",
+                            body=body,
+                        ),
+                    }
+                )
 
             elif self.notify_format == NotifyFormat.MARKDOWN:
-                _title = (
+                title_ = (
                     ""
                     if not title
                     else (
@@ -791,25 +820,22 @@ class NotifyMatrix(NotifyBase):
                     )
                 )
 
-                payload.update({
-                    "format": "org.matrix.custom.html",
-                    "formatted_body": "{title}{body}".format(
-                        title=_title,
-                        body=markdown(body),
-                    ),
-                })
+                payload.update(
+                    {
+                        "format": "org.matrix.custom.html",
+                        "formatted_body": "{title}{body}".format(
+                            title=title_,
+                            body=markdown(body),
+                        ),
+                    }
+                )
 
             # Post our content
-            postokay, _, _ = self._fetch(
-                path, payload=payload, method=method
-            )
+            postokay, _, _ = self._fetch(path, payload=payload, method="PUT")
 
             # Increment the transaction ID to avoid future messages being
             # recognized as retransmissions and ignored
-            if (
-                self.version == MatrixVersion.V3
-                and self.access_token != self.password
-            ):
+            if self.access_token != self.password:
                 self.transaction_id += 1
                 self.store.set(
                     "transaction_id",
@@ -839,13 +865,16 @@ class NotifyMatrix(NotifyBase):
                 # invalid attachment (bad file)
                 return False
 
-            if not IS_IMAGE.match(attachment.mimetype) \
-               and self.version == MatrixVersion.V2:
+            if (
+                not IS_IMAGE.match(attachment.mimetype)
+                and self.version == MatrixVersion.V2
+            ):
                 # unsuppored at this time
                 continue
 
-            postokay, response, _ = \
-                self._fetch("/upload", attachment=attachment)
+            postokay, response, _ = self._fetch(
+                "/upload", attachment=attachment
+            )
             if not (postokay and isinstance(response, dict)):
                 # Failed to perform upload
                 return False
@@ -858,29 +887,33 @@ class NotifyMatrix(NotifyBase):
             if self.version == MatrixVersion.V3:
                 # Prepare our payload
                 is_image = IS_IMAGE.match(attachment.mimetype)
-                payloads.append({
-                    "body": attachment.name,
-                    "info": {
-                        "mimetype": attachment.mimetype,
-                        "size": len(attachment),
-                    },
-                    "msgtype": "m.image" if is_image else "m.file",
-                    "url": response.get("content_uri"),
-                })
+                payloads.append(
+                    {
+                        "body": attachment.name,
+                        "info": {
+                            "mimetype": attachment.mimetype,
+                            "size": len(attachment),
+                        },
+                        "msgtype": "m.image" if is_image else "m.file",
+                        "url": response.get("content_uri"),
+                    }
+                )
                 if not is_image:
                     # Setup `m.file'
                     payloads[-1]["filename"] = attachment.name
 
             else:
                 # Prepare our payload
-                payloads.append({
-                    "info": {
-                        "mimetype": attachment.mimetype,
-                    },
-                    "msgtype": "m.image",
-                    "body": "tta.webp",
-                    "url": response.get("content_uri"),
-                })
+                payloads.append(
+                    {
+                        "info": {
+                            "mimetype": attachment.mimetype,
+                        },
+                        "msgtype": "m.image",
+                        "body": "tta.webp",
+                        "url": response.get("content_uri"),
+                    }
+                )
 
         return payloads
 
@@ -1075,44 +1108,59 @@ class NotifyMatrix(NotifyBase):
         # Check if it's a room id...
         result = IS_ROOM_ID.match(room)
         if result:
-            # We detected ourselves the home_server
+            room_token = result.group("room")
+            explicit_home_server = result.group("home_server")
+
+            # Determine the homeserver context (used for cache metadata)
             home_server = (
-                result.group("home_server")
-                if result.group("home_server")
+                explicit_home_server
+                if explicit_home_server
                 else self.home_server
             )
 
-            # It was a room ID; simple mapping:
-            room_id = "!{}:{}".format(
-                result.group("room"),
-                home_server,
-            )
+            # When hsreq is enabled (legacy behaviour), we always require a
+            # ':homeserver' segment on room IDs. Otherwise, we honour exactly
+            # what the caller provided and do not synthesise a homeserver when
+            # it was not specified.
+            cache_key = f"!{room_token}:{home_server}"
+            if explicit_home_server or self.hsreq:
+                room_id = cache_key
+            else:
+                room_id = f"!{room_token}"
 
             # Check our cache for speed:
             try:
-                # We're done as we've already joined the channel
-                return self.store[room_id]["id"]
+                return self.store[cache_key]["id"]
 
             except KeyError:
-                # No worries, we'll try to acquire the info
                 pass
 
             # Build our URL
             path = f"/join/{NotifyMatrix.quote(room_id)}"
 
-            # Make our query
-            postokay, _, _ = self._fetch(path, payload=payload)
-            if postokay:
-                # Cache our entry for fast access later
-                self.store.set(
-                    room_id,
-                    {
-                        "id": room_id,
-                        "home_server": home_server,
-                    },
-                )
+            # Attempt to join the channel
+            postokay, response, _status_code = self._fetch(
+                path, payload=payload
+            )
+            if not postokay:
+                return None
 
-            return room_id if postokay else None
+            # Prefer the server-provided room_id if one was returned,
+            # otherwise fall back to whatever we joined with.
+            joined_id = (
+                response.get("room_id") if isinstance(response, dict) else None
+            ) or room_id
+
+            # Cache mapping for faster future lookups.
+            self.store.set(
+                cache_key,
+                {
+                    "id": joined_id,
+                    "home_server": home_server,
+                },
+            )
+
+            return joined_id
 
         # Try to see if it's an alias then...
         result = IS_ROOM_ALIAS.match(room)
@@ -1166,8 +1214,10 @@ class NotifyMatrix(NotifyBase):
         # the alias does not exist. A join can fail for many reasons, such as
         # invite required, auth failure, or permissions, and in those cases
         # auto-creating is both noisy and incorrect.
-        if (status_code == requests.codes.not_found
-                or response.get("errcode") == "M_NOT_FOUND"):
+        if (
+            status_code == requests.codes.not_found
+            or response.get("errcode") == "M_NOT_FOUND"
+        ):
             return self._room_create(room)
 
         self.logger.warning(
@@ -1217,8 +1267,7 @@ class NotifyMatrix(NotifyBase):
             "preset": "trusted_private_chat",
         }
 
-        postokay, response, _ = \
-            self._fetch("/createRoom", payload=payload)
+        postokay, response, _ = self._fetch("/createRoom", payload=payload)
         if not postokay:
             # Failed to create channel
             # Typical responses:
@@ -1388,7 +1437,6 @@ class NotifyMatrix(NotifyBase):
         # event
         retries = self.default_retries if self.default_retries > 0 else 1
         while retries > 0:
-
             # Decrement our throttle retry count
             retries -= 1
 
@@ -1478,7 +1526,8 @@ class NotifyMatrix(NotifyBase):
                 self.logger.warning("Invalid response from Matrix server.")
                 self.logger.debug(
                     "Response Details:\r\n%r",
-                    b"" if not r else (r.content or b""))
+                    b"" if not r else (r.content or b""),
+                )
                 return (False, {}, status_code)
 
             except (requests.TooManyRedirects, requests.RequestException) as e:
@@ -1486,7 +1535,7 @@ class NotifyMatrix(NotifyBase):
                     "A Connection error occurred while registering with Matrix"
                     " server."
                 )
-                self.logger.debug("Socket Exception: %s", str(e))
+                self.logger.debug("Socket Exception: %s", e)
                 # Return; we're done
                 return (False, response, status_code)
 
@@ -1496,7 +1545,7 @@ class NotifyMatrix(NotifyBase):
                         attachment.name if attachment else "unknown file"
                     )
                 )
-                self.logger.debug("I/O Exception: %s", str(e))
+                self.logger.debug("I/O Exception: %s", e)
                 return (False, {}, status_code)
 
             return (True, response, status_code)
@@ -1553,6 +1602,7 @@ class NotifyMatrix(NotifyBase):
             "version": self.version,
             "msgtype": self.msgtype,
             "discovery": "yes" if self.discovery else "no",
+            "hsreq": "yes" if self.hsreq else "no",
         }
 
         # Extend our parameters
@@ -1631,6 +1681,13 @@ class NotifyMatrix(NotifyBase):
             )
         )
 
+        # Boolean to enforce ':homeserver' on room IDs when missing
+        results["hsreq"] = parse_bool(
+            results["qsd"].get(
+                "hsreq", NotifyMatrix.template_args["hsreq"]["default"]
+            )
+        )
+
         # Get our mode
         results["mode"] = results["qsd"].get("mode")
 
@@ -1642,7 +1699,6 @@ class NotifyMatrix(NotifyBase):
             and not results["password"]
             and not results["targets"]
         ):
-
             # Default mode to t2bot
             results["mode"] = MatrixWebhookMode.T2BOT
 
@@ -1731,12 +1787,13 @@ class NotifyMatrix(NotifyBase):
             return base_url
 
         # the Matrix ID at the first colon.
-        verify_url = \
+        verify_url = (
             "{schema}://{hostname}{port}/.well-known/matrix/client".format(
                 schema="https" if self.secure else "http",
                 hostname=self.host,
                 port=("" if not self.port else f":{self.port}"),
             )
+        )
 
         _, response, status_code = self._fetch(
             None, method="GET", url_override=verify_url
@@ -1775,8 +1832,10 @@ class NotifyMatrix(NotifyBase):
             # We're done early as we couldn't load the results
             msg = "Matrix Well-Known Base URI Discovery Failed"
             self.logger.warning(
-                    "%s - %s returned error code: %d",
-                    msg, verify_url, status_code,
+                "%s - %s returned error code: %d",
+                msg,
+                verify_url,
+                status_code,
             )
             raise MatrixDiscoveryException(msg, error_code=status_code)
 
@@ -1817,7 +1876,7 @@ class NotifyMatrix(NotifyBase):
             self.logger.warning(
                 "%s - m.homeserver payload is missing or invalid: %s",
                 msg,
-                str(response),
+                response,
             )
             raise MatrixDiscoveryException(msg)
 
@@ -1834,8 +1893,10 @@ class NotifyMatrix(NotifyBase):
             # We're done early as we couldn't load the results
             msg = "Matrix Well-Known Base URI Discovery Verification Failed"
             self.logger.warning(
-                    "%s - %s returned error code: %d",
-                    msg, verify_url, status_code,
+                "%s - %s returned error code: %d",
+                msg,
+                verify_url,
+                status_code,
             )
             raise MatrixDiscoveryException(msg, error_code=status_code)
 
@@ -1860,7 +1921,7 @@ class NotifyMatrix(NotifyBase):
                 self.logger.warning(
                     "%s - m.identity_server payload is missing or invalid: %s",
                     msg,
-                    str(response),
+                    response,
                 )
                 raise MatrixDiscoveryException(msg)
 
@@ -1878,7 +1939,9 @@ class NotifyMatrix(NotifyBase):
                 msg = "Matrix Well-Known Identity URI Discovery Failed"
                 self.logger.warning(
                     "%s - %s returned error code: %d",
-                    msg, verify_url, status_code,
+                    msg,
+                    verify_url,
+                    status_code,
                 )
                 raise MatrixDiscoveryException(msg, error_code=status_code)
 
